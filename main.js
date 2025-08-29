@@ -316,7 +316,8 @@ function initViewer() {
 		}, { passive: true });
 	}
 	animate();
-	loadGLB('book.glb');
+	// Load split assets: outer (front cover + spline) and pages 1-3
+	loadGLBs(['BOOK OUTER.glb', 'PAGE1.glb', 'PAGE2.glb', 'PAGE3.glb']);
 
 	// Load persisted pan limit settings
 	loadPanSettings();
@@ -930,6 +931,238 @@ function loadGLB(urlOrBuffer) {
 	} else {
 		loader.parse(urlOrBuffer, '', onLoad);
 	}
+}
+
+// Load multiple GLBs and merge into one group + mixer
+function loadGLBs(urls) {
+	if (currentModel) {
+		scene.remove(currentModel);
+		currentModel.traverse(child => {
+			if (child.isMesh) child.geometry.dispose();
+		});
+		currentModel = null;
+	}
+	mixer = null;
+	animationClips = [];
+	if (animButtonsContainer) animButtonsContainer.innerHTML = '';
+	nextReverseByClip.clear();
+	openBookReverseNext = false;
+	pageOpenByClip.clear();
+	playingDirectionByAction.clear();
+	frontCoverOpen = false;
+	latchOpen = false;
+
+	currentModel = new THREE.Group();
+	currentModel.name = 'book_group';
+	scene.add(currentModel);
+
+	const loader = new GLTFLoader();
+	const loadOne = (url) => new Promise((resolve, reject) => {
+		loader.load(url, (gltf) => resolve(gltf), undefined, reject);
+	});
+
+	Promise.all(urls.map(loadOne)).then((glts) => {
+		const allClips = [];
+		glts.forEach(gltf => {
+			if (gltf && gltf.scene) currentModel.add(gltf.scene);
+			if (gltf && gltf.animations && gltf.animations.length) {
+				allClips.push(...gltf.animations);
+			}
+		});
+
+		// Mobile default view
+		if (isMobileDevice()) {
+			camera.position.set(0.848, 2.395, 37.029);
+			controls.target.set(-1.148, 0.010, -4.349);
+			camera.fov = 45;
+			camera.updateProjectionMatrix();
+			controls.update();
+		}
+
+		// Debug names
+		currentModel.traverse(obj => {
+			if (obj.name) console.log('Object name:', obj.name);
+			if (obj.name === 'front_cover' || obj.name === 'latch') {
+				console.log('Found:', obj.name, 'Type:', obj.type, obj);
+			}
+		});
+
+		if (allClips.length > 0) {
+			mixer = new THREE.AnimationMixer(currentModel);
+			animationClips = allClips;
+			mixer.addEventListener('finished', (event) => {
+				const action = event.action;
+				if (!action) return;
+				const clip = action.getClip ? action.getClip() : action._clip;
+				const dir = playingDirectionByAction.get(action);
+				playingDirectionByAction.delete(action);
+				if (!clip || dir === undefined) return;
+				if (isPageClip(clip)) pageOpenByClip.set(clip, dir > 0);
+				if (isFrontCoverClip(clip)) frontCoverOpen = dir > 0;
+				if (isLatchClip(clip)) latchOpen = dir > 0;
+			});
+
+			// Debug: list clips and target nodes
+			console.group('GLTF Animation debug (multi)');
+			animationClips.forEach((clip, cIdx) => {
+				console.group(`Clip [${cIdx}]: ${clip.name || '(no name)'}`);
+				clip.tracks.forEach(track => {
+					const trackPath = track.name;
+					const nodeName = trackPath.split('.')[0];
+					const targetNode = currentModel.getObjectByName(nodeName);
+					if (targetNode) {
+						console.log(`Track: %c${trackPath}`, 'color:green', '-> Found node:', nodeName, targetNode);
+					} else {
+						console.warn(`Track: %c${trackPath}`, 'color:orange', '-> No node named', nodeName, 'under group');
+					}
+				});
+				console.groupEnd();
+			});
+			console.groupEnd();
+
+			// Build animation UI
+			if (SHOW_ANIM_CONTROLS && animButtonsContainer) {
+				animButtonsContainer.innerHTML = '';
+				const animGroup = document.createElement('details');
+				animGroup.style.maxWidth = '220px';
+				const animSummary = document.createElement('summary');
+				animSummary.textContent = 'Model animations';
+				animSummary.style.cursor = 'pointer';
+				animGroup.appendChild(animSummary);
+
+				const camDetails = document.createElement('details');
+				camDetails.style.margin = '10px 0';
+				const camSummary = document.createElement('summary');
+				camSummary.textContent = 'Camera Coordinates';
+				camSummary.style.cursor = 'pointer';
+				camDetails.appendChild(camSummary);
+
+				const toggleCoordsBtn = document.createElement('button');
+				toggleCoordsBtn.textContent = 'Toggle Camera Coords';
+				toggleCoordsBtn.style.display = 'block';
+				toggleCoordsBtn.style.marginBottom = '5px';
+				camDetails.appendChild(toggleCoordsBtn);
+
+				const coordsDisplay = document.createElement('div');
+				coordsDisplay.style.font = '12px monospace';
+				coordsDisplay.style.margin = '6px 0';
+				coordsDisplay.style.display = 'none';
+				camDetails.appendChild(coordsDisplay);
+
+				const copyCoordsBtn = document.createElement('button');
+				copyCoordsBtn.textContent = 'Copy Coords';
+				copyCoordsBtn.style.display = 'block';
+				copyCoordsBtn.style.marginBottom = '5px';
+				copyCoordsBtn.style.marginTop = '5px';
+				copyCoordsBtn.style.display = 'none';
+				camDetails.appendChild(copyCoordsBtn);
+
+				toggleCoordsBtn.onclick = () => {
+					if (coordsDisplay.style.display === 'none') {
+						if (camera) {
+							coordsDisplay.textContent =
+								`Position: { x: ${camera.position.x.toFixed(3)}, y: ${camera.position.y.toFixed(3)}, z: ${camera.position.z.toFixed(3)} }\n` +
+								`Target:   { x: ${controls.target.x.toFixed(3)}, y: ${controls.target.y.toFixed(3)}, z: ${controls.target.z.toFixed(3)} }`;
+						}
+						coordsDisplay.style.display = 'block';
+						copyCoordsBtn.style.display = 'block';
+					} else {
+						coordsDisplay.style.display = 'none';
+						copyCoordsBtn.style.display = 'none';
+					}
+				};
+
+				copyCoordsBtn.onclick = () => {
+					if (camera && controls) {
+						const coords =
+							`Position: { x: ${camera.position.x.toFixed(3)}, y: ${camera.position.y.toFixed(3)}, z: ${camera.position.z.toFixed(3)} }\n` +
+							`Target:   { x: ${controls.target.x.toFixed(3)}, y: ${controls.target.y.toFixed(3)}, z: ${controls.target.z.toFixed(3)} }`;
+						navigator.clipboard.writeText(coords);
+						copyCoordsBtn.textContent = 'Copied!';
+						setTimeout(() => { copyCoordsBtn.textContent = 'Copy Coords'; }, 1200);
+					}
+				};
+
+				animGroup.appendChild(camDetails);
+				if (!isMobileDevice()) {
+					const rotateWrap = document.createElement('label');
+					rotateWrap.style.display = 'block';
+					rotateWrap.style.margin = '6px 0 12px 0';
+					rotateWrap.style.font = '12px sans-serif';
+					const rotateToggle = document.createElement('input');
+					rotateToggle.type = 'checkbox';
+					rotateToggle.checked = controls ? !!controls.enableRotate : false;
+					rotateWrap.appendChild(rotateToggle);
+					rotateWrap.appendChild(document.createTextNode(' Enable rotation'));
+					rotateToggle.addEventListener('change', () => {
+						const enable = !!rotateToggle.checked;
+						if (controls) {
+							controls.enableRotate = enable;
+							if (THREE.TOUCH) {
+								controls.touches.ONE = enable ? THREE.TOUCH.ROTATE : THREE.TOUCH.PAN;
+								controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
+							}
+						}
+					});
+					animGroup.appendChild(rotateWrap);
+				}
+
+				const frontClips = animationClips.filter(isFrontCoverClip);
+				const latchClips = animationClips.filter(isLatchClip);
+				if (frontClips.length > 0) {
+					const btnOpenFront = document.createElement('button');
+					btnOpenFront.textContent = 'Open front_cover';
+					btnOpenFront.style.display = 'block';
+					btnOpenFront.style.marginBottom = '5px';
+					btnOpenFront.onclick = () => { if (isAnyAnimationPlaying()) return; playFrontCoverDirection(1, frontClips, latchClips); };
+					animGroup.appendChild(btnOpenFront);
+					const btnCloseFront = document.createElement('button');
+					btnCloseFront.textContent = 'Close front_cover';
+					btnCloseFront.style.display = 'block';
+					btnCloseFront.style.marginBottom = '12px';
+					btnCloseFront.onclick = () => { if (isAnyAnimationPlaying()) return; playFrontCoverDirection(-1, frontClips, latchClips); };
+					animGroup.appendChild(btnCloseFront);
+				}
+				if (latchClips.length > 0) {
+					const btnOpenLatch = document.createElement('button');
+					btnOpenLatch.textContent = 'Open latch';
+					btnOpenLatch.style.display = 'block';
+					btnOpenLatch.style.marginBottom = '5px';
+					btnOpenLatch.onclick = () => { if (isAnyAnimationPlaying()) return; playLatchDirection(1, latchClips); };
+					animGroup.appendChild(btnOpenLatch);
+					const btnCloseLatch = document.createElement('button');
+					btnCloseLatch.textContent = 'Close latch';
+					btnCloseLatch.style.display = 'block';
+					btnCloseLatch.style.marginBottom = '12px';
+					btnCloseLatch.onclick = () => { if (isAnyAnimationPlaying()) return; playLatchDirection(-1, latchClips); };
+					animGroup.appendChild(btnCloseLatch);
+				}
+
+				getOrderedPageClips().forEach((clip) => {
+					const pageName = getPrimaryPageName(clip) || (clip.name || `page`);
+					const btnOpen = document.createElement('button');
+					btnOpen.textContent = `Open ${pageName}`;
+					btnOpen.style.display = 'block';
+					btnOpen.style.marginBottom = '5px';
+					btnOpen.onclick = () => { if (isAnyAnimationPlaying()) return; playClipDirection(clip, 1, true); };
+					animGroup.appendChild(btnOpen);
+					const btnClose = document.createElement('button');
+					btnClose.textContent = `Close ${pageName}`;
+					btnClose.style.display = 'block';
+					btnClose.style.marginBottom = '12px';
+					btnClose.onclick = () => { if (isAnyAnimationPlaying()) return; playClipDirection(clip, -1, true); };
+					animGroup.appendChild(btnClose);
+					pageOpenByClip.set(clip, false);
+					nextReverseByClip.set(clip, false);
+				});
+
+				animButtonsContainer.appendChild(animGroup);
+				animButtonsContainer.style.display = 'none';
+			}
+		}
+	}).catch((err) => {
+		console.error('Failed to load split GLBs', err);
+	});
 }
 
 function isPageClip(clip) {
