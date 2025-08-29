@@ -1,0 +1,1361 @@
+// (Removed camera tick import/UI to match reference pan behavior)
+// Smoothly open all previous pages in order until reaching the target page
+function openPagesThen(targetClip, done) {
+	const ordered = getOrderedPageClips();
+	const idx = ordered.indexOf(targetClip);
+	if (idx === -1) {
+		done && done();
+		return;
+	}
+	// Find all previous pages that are not open
+	const toOpen = [];
+	for (let i = 0; i < idx; i++) {
+		if (pageOpenByClip.get(ordered[i]) !== true) {
+			toOpen.push(ordered[i]);
+		}
+	}
+	if (toOpen.length === 0) {
+		done && done();
+		return;
+	}
+	// Open pages one by one
+	const [first, ...rest] = toOpen;
+	// Stop conflicting actions for the page we are about to open
+	const targets = getClipTargetNodeNames(first);
+	stopConflictingActions(targets, [first]);
+	const action = mixer.clipAction(first);
+	action.enabled = true;
+	action.setLoop(THREE.LoopOnce, 1);
+	action.clampWhenFinished = true;
+	action.reset();
+	action.timeScale = 1;
+	action.play();
+	playingDirectionByAction.set(action, 1);
+	const handler = (e) => {
+		if (e.action === action) {
+			mixer.removeEventListener('finished', handler);
+			if (rest.length > 0) {
+				openPagesThen(targetClip, done);
+			} else {
+				done && done();
+			}
+		}
+	};
+	mixer.addEventListener('finished', handler);
+}
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+let scene, camera, renderer, controls, currentModel;
+let mixer = null, animationClips = null;
+let animButtonsContainer = null;
+const SHOW_ANIM_CONTROLS = true; // allow menu; toggled with SPACE
+// Track per-clip toggle state: false -> forward next, true -> reverse next
+const nextReverseByClip = new Map();
+// Toggle for Open Book (latch + front_cover) sequence
+let openBookReverseNext = false;
+// Track per-page open state (true=open/end pose, false=closed/start pose)
+const pageOpenByClip = new Map();
+// Track direction of actions currently playing so we can update state on finish
+const playingDirectionByAction = new Map();
+// Track front cover state
+let frontCoverOpen = false;
+// Track latch state
+let latchOpen = false;
+// Keep references to lights for UI controls
+let ambientLightRef = null;
+let directionalLightRef = null;
+let cameraInfoEl = null;
+let lastCamHudUpdate = 0;
+// Raycast + tap detection (mobile)
+let raycaster = null;
+let _touchDownPos = null;
+let _touchDownTime = 0;
+// Drag-to-turn state
+let dragState = null; // { type: 'page'|'front', pageClip?, frontClips?, latchClips?, action?, actions?, startX, startY, startT, duration, sensitivity }
+let _didDrag = false;
+let _potentialDragTarget = null; // cached pick at pointerdown
+// Pan boundary settings (persisted)
+let panLimitEnabled = true;
+let panLimitRadius = 10; // world units
+let panOriginTarget = new THREE.Vector3(-9.121, 0.358, -3.984); // default origin
+
+function loadPanSettings() {
+	try {
+		const enabled = localStorage.getItem('panLimitEnabled');
+		const radius = localStorage.getItem('panLimitRadius');
+		const originStr = localStorage.getItem('panOriginTarget');
+		if (enabled !== null) panLimitEnabled = enabled === 'true';
+		if (radius !== null) panLimitRadius = parseFloat(radius) || 0;
+		if (originStr) {
+			const arr = JSON.parse(originStr);
+			if (Array.isArray(arr) && arr.length === 3) {
+				panOriginTarget = new THREE.Vector3(arr[0], arr[1], arr[2]);
+			}
+		}
+	} catch {}
+}
+
+function savePanSettings() {
+	try {
+		localStorage.setItem('panLimitEnabled', String(panLimitEnabled));
+		localStorage.setItem('panLimitRadius', String(panLimitRadius));
+		if (panOriginTarget) {
+			localStorage.setItem('panOriginTarget', JSON.stringify([panOriginTarget.x, panOriginTarget.y, panOriginTarget.z]));
+		}
+	} catch {}
+}
+
+function isMobileDevice() {
+	return (typeof window !== 'undefined') && (
+		/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)
+		|| (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+	);
+}
+
+function isAnyAnimationPlaying() {
+	return playingDirectionByAction && playingDirectionByAction.size > 0;
+}
+
+// Produce a ready-to-paste snippet for setting the current camera view
+function formatCameraSnippet() {
+	const p = camera && camera.position ? camera.position : { x: 0, y: 0, z: 0 };
+	const t = controls && controls.target ? controls.target : { x: 0, y: 0, z: 0 };
+	const fov = camera && typeof camera.fov === 'number' ? camera.fov : 45;
+	const fmt = (n) => (Math.abs(n) < 1e-6 ? 0 : Number(n)).toFixed(3);
+	return [
+		`camera.position.set(${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)});`,
+		`controls.target.set(${fmt(t.x)}, ${fmt(t.y)}, ${fmt(t.z)});`,
+		`camera.fov = ${fmt(fov)};`,
+		`camera.updateProjectionMatrix();`
+	].join('\n');
+}
+
+function fitCameraToObject(camera, controls, object3D, offset = 1.2) {
+	// Compute bounding box of the object
+	const box = new THREE.Box3().setFromObject(object3D);
+	if (!box.isEmpty()) {
+		const size = new THREE.Vector3();
+		box.getSize(size);
+		const center = new THREE.Vector3();
+		box.getCenter(center);
+		// Set controls target to center
+		if (controls) controls.target.copy(center);
+		// Compute distance needed to fit object in view based on fov and aspect
+		const maxSize = Math.max(size.x, size.y, size.z);
+		const fov = camera.fov * (Math.PI / 180);
+		const aspect = camera.aspect;
+		// Vertical fit distance
+		const vDist = (maxSize / 2) / Math.tan(fov / 2);
+		// Horizontal fit distance accounts for aspect
+		const hFov = 2 * Math.atan(Math.tan(fov / 2) * aspect);
+		const hDist = (maxSize / 2) / Math.tan(hFov / 2);
+		const dist = Math.max(vDist, hDist) * offset;
+		// Move camera along the vector from center toward current camera position
+		const fromCenterDir = camera.position.clone().sub(center);
+		if (fromCenterDir.lengthSq() < 1e-6) {
+			// Degenerate: pick a sane default direction if camera is at center
+			fromCenterDir.set(0, 0, 1);
+		}
+		fromCenterDir.normalize();
+		camera.position.copy(center.clone().add(fromCenterDir.multiplyScalar(dist)));
+		camera.updateProjectionMatrix();
+		if (controls) controls.update();
+	}
+}
+
+function initViewer() {
+	const container = document.getElementById('viewer');
+	animButtonsContainer = document.getElementById('animButtons');
+	// No animations menu in this build
+	if (animButtonsContainer) animButtonsContainer.style.display = 'none';
+	cameraInfoEl = document.getElementById('cameraInfo');
+	scene = new THREE.Scene();
+	scene.background = new THREE.Color(0xf0f0f0);
+
+	camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+	if (isMobileDevice()) {
+		// Mobile default view requested by user
+		camera.position.set(0.848, 2.395, 37.029);
+		// fov already 45; ensure projection updated
+		camera.fov = 45;
+		camera.updateProjectionMatrix();
+	} else {
+		camera.position.set(-4.459, 0.474, 21.784);
+	}
+
+	renderer = new THREE.WebGLRenderer({ antialias: true });
+	renderer.setSize(container.clientWidth, container.clientHeight);
+	container.appendChild(renderer.domElement);
+
+	// Raycaster for mobile tap picking
+	raycaster = new THREE.Raycaster();
+
+	const ambientLight = new THREE.AmbientLight(0xffffff, 2.0);
+	scene.add(ambientLight);
+	const directionalLight = new THREE.DirectionalLight(0xffffff, 2.0);
+	directionalLight.position.set(5, 10, 7.5);
+	scene.add(directionalLight);
+	ambientLightRef = ambientLight;
+	directionalLightRef = directionalLight;
+
+	controls = new OrbitControls(camera, renderer.domElement);
+	if (isMobileDevice()) {
+		controls.target.set(-1.148, 0.010, -4.349);
+	} else {
+		controls.target.set(-4.459, -0.269, -0.411);
+	}
+	controls.enableRotate = false; // disable rotation; allow pan and zoom
+	controls.enablePan = true;
+	controls.enableZoom = true;
+	// Make single-finger touch perform panning on touch devices
+	if (THREE.TOUCH) {
+		controls.touches = controls.touches || {};
+		controls.touches.ONE = THREE.TOUCH.PAN;
+		// Keep two-finger gesture for dolly (zoom)
+		controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
+	}
+	// Mobile: set maximum zoom-in level (minDistance) to match requested view
+	if (isMobileDevice()) {
+		const maxInPos = new THREE.Vector3(-1.587, 1.381, 4.671);
+		const maxInTarget = new THREE.Vector3(-2.023, 0.861, -4.356);
+		controls.minDistance = maxInPos.distanceTo(maxInTarget);
+		// Set maximum zoom-out distance from provided far view
+		const maxOutPos = new THREE.Vector3(-6.756, 2.575, 34.772);
+		const maxOutTarget = new THREE.Vector3(-8.627, 0.340, -4.007);
+		controls.maxDistance = maxOutPos.distanceTo(maxOutTarget) * 1.2; // a little more zoom-out on mobile
+	} else {
+		// Desktop (PC): set maximum zoom-in level per request
+		const pcMaxInPos = new THREE.Vector3(0.733, 1.071, 7.208);
+		const pcMaxInTarget = new THREE.Vector3(0.733, 0.702, -3.820);
+		controls.minDistance = pcMaxInPos.distanceTo(pcMaxInTarget);
+		// PC maximum zoom-out based on provided view
+		const pcMaxOutPos = new THREE.Vector3(-5.565, 0.657, 31.426);
+		const pcMaxOutTarget = new THREE.Vector3(-5.565, -0.527, -3.955);
+		controls.maxDistance = pcMaxOutPos.distanceTo(pcMaxOutTarget);
+		controls.zoomSpeed = 1.0;
+	}
+
+	// Mobile/desktop drag-to-turn and click/tap toggle
+	if (isMobileDevice()) {
+		const canvas = renderer.domElement;
+		canvas.addEventListener('pointerdown', (ev) => {
+			if (ev.pointerType !== 'touch') return;
+			_touchDownPos = { x: ev.clientX, y: ev.clientY };
+			_touchDownTime = performance.now();
+			_didDrag = false;
+			_potentialDragTarget = detectTurnableAt(ev.clientX, ev.clientY);
+		}, { passive: true });
+		canvas.addEventListener('pointermove', (ev) => {
+			if (ev.pointerType !== 'touch') return;
+			if (!_touchDownPos) return;
+			const moved = Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y);
+			if (dragState) {
+				_didDrag = true;
+				updateDrag(ev.clientX, ev.clientY);
+				return;
+			}
+			if (moved > 8 && _potentialDragTarget) {
+				if (beginDrag(_potentialDragTarget, ev.clientX, ev.clientY)) {
+					_didDrag = true;
+				}
+			}
+		}, { passive: true });
+		canvas.addEventListener('pointerup', (ev) => {
+			if (ev.pointerType !== 'touch') return;
+			const tNow = performance.now();
+			const moved = _touchDownPos ? Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y) : 1e9;
+			const dt = tNow - _touchDownTime;
+			if (dragState) {
+				endDrag();
+			} else if (_touchDownPos && !_didDrag && moved < 8 && dt < 350) {
+				handleMobileTap(ev);
+			}
+			_touchDownPos = null;
+			_potentialDragTarget = null;
+		}, { passive: true });
+	} else {
+		const canvas = renderer.domElement;
+		canvas.addEventListener('pointerdown', (ev) => {
+			if (ev.pointerType !== 'mouse' && ev.pointerType !== 'pen') return;
+			if (ev.button !== 0) return; // left click only
+			_touchDownPos = { x: ev.clientX, y: ev.clientY };
+			_touchDownTime = performance.now();
+			_didDrag = false;
+			_potentialDragTarget = detectTurnableAt(ev.clientX, ev.clientY);
+		}, { passive: true });
+		canvas.addEventListener('pointermove', (ev) => {
+			if (ev.pointerType !== 'mouse' && ev.pointerType !== 'pen') return;
+			if (!_touchDownPos) return;
+			const moved = Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y);
+			if (dragState) {
+				_didDrag = true;
+				updateDrag(ev.clientX, ev.clientY);
+				return;
+			}
+			if (moved > 6 && _potentialDragTarget) {
+				if (beginDrag(_potentialDragTarget, ev.clientX, ev.clientY)) {
+					_didDrag = true;
+				}
+			}
+		}, { passive: true });
+		canvas.addEventListener('pointerup', (ev) => {
+			if (ev.pointerType !== 'mouse' && ev.pointerType !== 'pen') return;
+			if (ev.button !== 0) return; // left click only
+			const tNow = performance.now();
+			const moved = _touchDownPos ? Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y) : 1e9;
+			const dt = tNow - _touchDownTime;
+			if (dragState) {
+				endDrag();
+			} else if (_touchDownPos && !_didDrag && moved < 6 && dt < 300) {
+				handlePointerPick(ev.clientX, ev.clientY);
+			}
+			_touchDownPos = null;
+			_potentialDragTarget = null;
+		}, { passive: true });
+	}
+	animate();
+	loadGLB('book.glb');
+
+	// Load persisted pan limit settings
+	loadPanSettings();
+	if (!panOriginTarget) {
+		panOriginTarget = controls.target.clone();
+	}
+
+	// Hide control menu by default; toggle with SPACE BAR
+	window.addEventListener('keydown', (ev) => {
+		if (ev.code === 'Space' && animButtonsContainer) {
+			animButtonsContainer.style.display = (animButtonsContainer.style.display === 'none') ? '' : 'none';
+		}
+	});
+
+}
+
+function getFrontClips() {
+	return (animationClips || []).filter(isFrontCoverClip);
+}
+
+function getLatchClips() {
+	return (animationClips || []).filter(isLatchClip);
+}
+
+// Spline clips that should play with the front cover
+function getSplineClips() {
+	if (!animationClips) return [];
+	return animationClips.filter(clip => {
+		if (clip.name && typeof clip.name === 'string' && clip.name.toLowerCase().includes('spline')) return true;
+		return clip.tracks.some(track => track.name.split('.')[0] === 'spline');
+	});
+}
+
+function findPageClipForNodeName(nodeName) {
+	if (!animationClips || !nodeName) return null;
+	for (const clip of animationClips) {
+		if (!isPageClip(clip)) continue;
+		for (const track of clip.tracks) {
+			const n = track.name.split('.')[0];
+			if (n === nodeName) return clip;
+		}
+	}
+	return null;
+}
+
+function normalizeName(str) {
+	if (!str || typeof str !== 'string') return '';
+	// Lowercase, remove spaces, strip Blender instance suffix like .001
+	return str.toLowerCase().replace(/\s+/g, '').replace(/\.[0-9]+$/, '');
+}
+
+function getAncestorNames(obj) {
+	const names = [];
+	let cur = obj;
+	while (cur) {
+		if (cur.name) names.push(cur.name);
+		cur = cur.parent;
+	}
+	return names;
+}
+
+function findPageClipForObject(obj) {
+	if (!animationClips || !obj) return null;
+	const ancestorNames = getAncestorNames(obj).map(normalizeName);
+	// First pass: match against clip track target node names
+	for (const clip of animationClips) {
+		if (!isPageClip(clip)) continue;
+		for (const track of clip.tracks) {
+			const nodeName = track.name.split('.')[0];
+			const tn = normalizeName(nodeName);
+			if (ancestorNames.includes(tn)) return clip;
+		}
+	}
+	// Second pass: match against primary page name or clip name
+	for (const clip of animationClips) {
+		if (!isPageClip(clip)) continue;
+		const primary = getPrimaryPageName(clip) || clip.name || '';
+		const pn = normalizeName(primary);
+		if (pn && ancestorNames.includes(pn)) return clip;
+	}
+	return null;
+}
+
+function findNamedAncestor(obj) {
+	let cur = obj;
+	while (cur) {
+		if (cur.name && typeof cur.name === 'string' && cur.name.length > 0) return cur;
+		cur = cur.parent;
+	}
+	return null;
+}
+
+function handleMobileTap(ev) {
+	handlePointerPick(ev.clientX, ev.clientY);
+}
+
+function handlePointerPick(clientX, clientY) {
+	if (!camera || !currentModel || !raycaster) return;
+	if (isAnyAnimationPlaying()) return;
+	const canvas = renderer.domElement;
+	const rect = canvas.getBoundingClientRect();
+	const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+	const y = -((clientY - rect.top) / rect.height) * 2 + 1;
+	raycaster.setFromCamera({ x, y }, camera);
+	const hits = raycaster.intersectObject(currentModel, true);
+	if (!hits || hits.length === 0) return;
+	const ancestorNames = getAncestorNames(hits[0].object).map(normalizeName);
+	// Front cover detection (robust)
+	if (ancestorNames.includes(normalizeName('front_cover'))) {
+		const dir = frontCoverOpen ? -1 : 1;
+		const frontClips = getFrontClips();
+		const latchClips = getLatchClips();
+		playFrontCoverDirection(dir, frontClips, latchClips);
+		return;
+	}
+	if (ancestorNames.includes(normalizeName('latch'))) {
+		const dir = latchOpen ? -1 : 1;
+		const latchClips = getLatchClips();
+		playLatchDirection(dir, latchClips);
+		return;
+	}
+	// Pages: try to resolve the tapped object (or its ancestors) to a page clip
+	const pageClip = findPageClipForObject(hits[0].object);
+	if (pageClip) {
+		const isOpen = pageOpenByClip.get(pageClip) === true;
+		const dir = isOpen ? -1 : 1;
+		playClipDirection(pageClip, dir, true);
+		return;
+	}
+}
+
+// Detect a draggable target (front cover or page) under screen coords
+function detectTurnableAt(clientX, clientY) {
+	if (!camera || !currentModel || !raycaster) return null;
+	const canvas = renderer.domElement;
+	const rect = canvas.getBoundingClientRect();
+	const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+	const y = -((clientY - rect.top) / rect.height) * 2 + 1;
+	raycaster.setFromCamera({ x, y }, camera);
+	const hits = raycaster.intersectObject(currentModel, true);
+	if (!hits || hits.length === 0) return null;
+	const ancestorNames = getAncestorNames(hits[0].object).map(normalizeName);
+	if (ancestorNames.includes(normalizeName('front_cover'))) {
+		return { type: 'front', frontClips: getFrontClips(), latchClips: getLatchClips() };
+	}
+	const pageClip = findPageClipForObject(hits[0].object);
+	if (pageClip) return { type: 'page', pageClip };
+	return null;
+}
+
+function beginDrag(target, clientX, clientY) {
+	if (!mixer || !target) return false;
+	if (isAnyAnimationPlaying()) return false;
+	if (target.type === 'page' && !frontCoverOpen) return false; // can't turn pages while closed
+	const canvas = renderer.domElement;
+	const rect = canvas.getBoundingClientRect();
+	const width = Math.max(1, rect.width);
+	const baseSensitivity = 1.2; // higher = faster open per pixel
+	if (target.type === 'page') {
+		const clip = target.pageClip;
+		const targets = getClipTargetNodeNames(clip);
+		stopConflictingActions(targets, [clip]);
+		const action = mixer.existingAction(clip) || mixer.clipAction(clip);
+		action.enabled = true;
+		action.setLoop(THREE.LoopOnce, 1);
+		action.clampWhenFinished = true;
+		// Initialize time from current known state
+		if (pageOpenByClip.get(clip) === true) {
+			action.play();
+			action.paused = true;
+			action.time = clip.duration; // start open
+		} else {
+			action.reset();
+			action.play();
+			action.paused = true;
+			action.time = 0;
+		}
+		dragState = {
+			type: 'page',
+			pageClip: clip,
+			action,
+			startX: clientX,
+			startY: clientY,
+			startT: action.time / clip.duration,
+			duration: clip.duration,
+			sensitivity: baseSensitivity / width
+		};
+	} else if (target.type === 'front' && target.frontClips && target.frontClips.length > 0) {
+		// Include spline clips so they scrub with the front cover
+		const splineClips = getSplineClips();
+		const combinedClips = [...target.frontClips, ...splineClips];
+		// Stop conflicting actions for all involved clips
+		const combinedTargets = new Set();
+		combinedClips.forEach(c => getClipTargetNodeNames(c).forEach(n => combinedTargets.add(n)));
+		stopConflictingActions(combinedTargets, combinedClips);
+		const actions = combinedClips.map(clip => {
+			const a = mixer.existingAction(clip) || mixer.clipAction(clip);
+			a.enabled = true;
+			a.setLoop(THREE.LoopOnce, 1);
+			a.clampWhenFinished = true;
+			if (frontCoverOpen) {
+				a.play();
+				a.paused = true;
+				a.time = clip.duration;
+			} else {
+				a.reset();
+				a.play();
+				a.paused = true;
+				a.time = 0;
+			}
+			return { clip, action: a };
+		});
+		dragState = {
+			type: 'front',
+			actions,
+			latchClips: target.latchClips || [],
+			startX: clientX,
+			startY: clientY,
+			startT: actions.length ? (actions[0].action.time / actions[0].clip.duration) : 0,
+			duration: actions.length ? actions[0].clip.duration : 1,
+			sensitivity: baseSensitivity / width
+		};
+	}
+	if (dragState) {
+		if (controls) controls.enabled = false; // disable pan/zoom while dragging
+		return true;
+	}
+	return false;
+}
+
+function updateDrag(clientX, clientY) {
+	if (!dragState) return;
+	const dx = clientX - dragState.startX;
+	// Dragging left (negative dx) opens (increase t), right closes
+	let t = dragState.startT + (-dx) * dragState.sensitivity; // invert so left opens
+	t = Math.min(1, Math.max(0, t));
+	if (dragState.type === 'page') {
+		const { action, duration } = dragState;
+		action.time = t * duration;
+	} else if (dragState.type === 'front') {
+		const { actions } = dragState;
+		actions.forEach(({ clip, action }) => {
+			action.time = t * clip.duration;
+		});
+	}
+}
+
+function endDrag() {
+	if (!dragState) return;
+	const t = (dragState.type === 'page')
+		? (dragState.action.time / dragState.duration)
+		: (dragState.actions && dragState.actions.length ? dragState.actions[0].action.time / dragState.actions[0].clip.duration : 0);
+	const openDir = t >= 0.5 ? 1 : -1;
+	if (dragState.type === 'page') {
+		finishPageDrag(openDir);
+	} else if (dragState.type === 'front') {
+		finishFrontDrag(openDir);
+	}
+	if (controls) controls.enabled = true;
+	dragState = null;
+}
+
+function finishPageDrag(direction) {
+	const clip = dragState.pageClip;
+	const action = dragState.action;
+	const ordered = getOrderedPageClips();
+	const idx = ordered.indexOf(clip);
+	if (direction > 0) {
+		const laterOpen = [];
+		for (let i = ordered.length - 1; i > idx; i--) {
+			if (pageOpenByClip.get(ordered[i]) === true) laterOpen.push(ordered[i]);
+		}
+		const proceedAfterLaterClosed = () => {
+			let needPrevOpen = false;
+			for (let i = 0; i < idx; i++) {
+				if (pageOpenByClip.get(ordered[i]) !== true) { needPrevOpen = true; break; }
+			}
+			const resume = () => {
+				action.paused = false;
+				action.timeScale = 1;
+				playingDirectionByAction.set(action, 1);
+			};
+			if (needPrevOpen) openPagesThen(clip, resume); else resume();
+		};
+		if (laterOpen.length > 0) {
+			closePagesThen(proceedAfterLaterClosed, laterOpen);
+		} else {
+			proceedAfterLaterClosed();
+		}
+	} else {
+		for (let i = idx + 1; i < ordered.length; i++) {
+			if (pageOpenByClip.get(ordered[i]) === true) {
+				action.paused = false;
+				action.timeScale = 1;
+				playingDirectionByAction.set(action, 1);
+				return;
+			}
+		}
+		action.paused = false;
+		action.timeScale = -1;
+		playingDirectionByAction.set(action, -1);
+	}
+}
+
+function finishFrontDrag(direction) {
+	const actions = dragState.actions || [];
+	const latchClips = dragState.latchClips || [];
+	if (direction > 0) {
+		if (!latchOpen && latchClips.length > 0) {
+			const startedLatch = playLatchDirection(1, latchClips, /*returnActions*/ true) || [];
+			if (startedLatch.length > 0) {
+				const remaining = new Set(startedLatch);
+				const onLatch = (e) => {
+					if (remaining.has(e.action)) {
+						remaining.delete(e.action);
+						if (remaining.size === 0) {
+							mixer.removeEventListener('finished', onLatch);
+							resumeFront(direction, actions);
+						}
+					}
+				};
+				mixer.addEventListener('finished', onLatch);
+				return;
+			}
+		}
+		resumeFront(direction, actions);
+	} else {
+		const orderedPages = getOrderedPageClips();
+		const openPagesDesc = orderedPages
+			.filter(c => pageOpenByClip.get(c) === true)
+			.sort((a, b) => extractPageIndex(getPrimaryPageName(b) || b.name) - extractPageIndex(getPrimaryPageName(a) || a.name));
+		if (openPagesDesc.length > 0) {
+			closePagesThen(() => {
+				resumeFront(direction, actions, () => {
+					if (latchClips.length > 0) playLatchDirection(-1, latchClips);
+				});
+			}, openPagesDesc);
+			return;
+		}
+		resumeFront(direction, actions, () => {
+			if (latchClips.length > 0) playLatchDirection(-1, latchClips);
+		});
+	}
+}
+
+function resumeFront(direction, actions, afterAll) {
+	if (!mixer) return;
+	const remaining = new Set();
+	actions.forEach(({ action }) => {
+		action.paused = false;
+		action.timeScale = direction > 0 ? 1 : -1;
+		playingDirectionByAction.set(action, direction > 0 ? 1 : -1);
+		remaining.add(action);
+	});
+	if (remaining.size > 0) {
+		const onFin = (e) => {
+			if (remaining.has(e.action)) {
+				remaining.delete(e.action);
+				if (remaining.size === 0) {
+					mixer.removeEventListener('finished', onFin);
+					if (afterAll) afterAll();
+				}
+			}
+		};
+		mixer.addEventListener('finished', onFin);
+	} else if (afterAll) {
+		afterAll();
+	}
+}
+
+function loadGLB(urlOrBuffer) {
+	if (currentModel) {
+		scene.remove(currentModel);
+		currentModel.traverse(child => {
+			if (child.isMesh) child.geometry.dispose();
+		});
+		currentModel = null;
+	}
+	if (mixer) mixer = null;
+	animationClips = null;
+	if (animButtonsContainer) animButtonsContainer.innerHTML = '';
+	nextReverseByClip.clear();
+	openBookReverseNext = false;
+	pageOpenByClip.clear();
+	playingDirectionByAction.clear();
+	frontCoverOpen = false;
+	latchOpen = false;
+	const loader = new GLTFLoader();
+	const onLoad = (gltf) => {
+		currentModel = gltf.scene;
+		scene.add(currentModel);
+		// On mobile, set exact default view (requested values)
+		if (isMobileDevice()) {
+			camera.position.set(0.848, 2.395, 37.029);
+			controls.target.set(-1.148, 0.010, -4.349);
+			camera.fov = 45;
+			camera.updateProjectionMatrix();
+			controls.update();
+		}
+		// Debug: log all object names in the loaded scene
+		currentModel.traverse(obj => {
+			if (obj.name) {
+				console.log('Object name:', obj.name);
+			}
+			if (obj.name === 'front_cover' || obj.name === 'latch') {
+				console.log('Found:', obj.name, 'Type:', obj.type, obj);
+			}
+		});
+		// Build the AnimationMixer on the full glTF scene so track target names
+		// (which are usually absolute or relative to the scene root) can be resolved.
+		if (gltf.animations && gltf.animations.length > 0) {
+			mixer = new THREE.AnimationMixer(currentModel);
+			animationClips = gltf.animations;
+			// Update per-page, front cover, and latch state when actions finish
+			mixer.addEventListener('finished', (event) => {
+				const action = event.action;
+				if (!action) return;
+				const clip = action.getClip ? action.getClip() : action._clip;
+				const dir = playingDirectionByAction.get(action);
+				playingDirectionByAction.delete(action);
+				if (!clip || dir === undefined) return;
+				if (isPageClip(clip)) {
+					// dir > 0 => now open; dir < 0 => now closed
+					pageOpenByClip.set(clip, dir > 0);
+				}
+				if (isFrontCoverClip(clip)) {
+					frontCoverOpen = dir > 0;
+				}
+				if (isLatchClip(clip)) {
+					latchOpen = dir > 0;
+				}
+			});
+
+			// Debug: list clips and where each track is trying to bind
+			console.group('GLTF Animation debug');
+			animationClips.forEach((clip, cIdx) => {
+				console.group(`Clip [${cIdx}]: ${clip.name || '(no name)'}`);
+				clip.tracks.forEach(track => {
+					const trackPath = track.name; // e.g. 'page1.position'
+					const nodeName = trackPath.split('.')[0];
+					const targetNode = currentModel.getObjectByName(nodeName);
+					if (targetNode) {
+						console.log(`Track: %c${trackPath}` , 'color:green', '-> Found node:', nodeName, targetNode);
+					} else {
+						console.warn(`Track: %c${trackPath}` , 'color:orange', '-> No node named', nodeName, 'under gltf.scene');
+					}
+				});
+				console.groupEnd();
+			});
+			console.groupEnd();
+
+			// Generate buttons for each animation
+			if (SHOW_ANIM_CONTROLS && animButtonsContainer) {
+				animButtonsContainer.innerHTML = '';
+				// Create dropdown container
+				const animGroup = document.createElement('details');
+				animGroup.style.maxWidth = '220px';
+				const animSummary = document.createElement('summary');
+				animSummary.textContent = 'Model animations';
+				animSummary.style.cursor = 'pointer';
+				animGroup.appendChild(animSummary);
+
+				// --- Camera Coordinates Subcategory ---
+				const camDetails = document.createElement('details');
+				camDetails.style.margin = '10px 0';
+				const camSummary = document.createElement('summary');
+				camSummary.textContent = 'Camera Coordinates';
+				camSummary.style.cursor = 'pointer';
+				camDetails.appendChild(camSummary);
+
+				// Toggle camera coordinates display
+				const toggleCoordsBtn = document.createElement('button');
+				toggleCoordsBtn.textContent = 'Toggle Camera Coords';
+				toggleCoordsBtn.style.display = 'block';
+				toggleCoordsBtn.style.marginBottom = '5px';
+				camDetails.appendChild(toggleCoordsBtn);
+
+				// Camera coordinates display element
+				const coordsDisplay = document.createElement('div');
+				coordsDisplay.style.font = '12px monospace';
+				coordsDisplay.style.margin = '6px 0';
+				coordsDisplay.style.display = 'none';
+				camDetails.appendChild(coordsDisplay);
+
+				// Copy to clipboard button
+				const copyCoordsBtn = document.createElement('button');
+				copyCoordsBtn.textContent = 'Copy Coords';
+				copyCoordsBtn.style.display = 'block';
+				copyCoordsBtn.style.marginBottom = '5px';
+				copyCoordsBtn.style.marginTop = '5px';
+				copyCoordsBtn.style.display = 'none';
+				camDetails.appendChild(copyCoordsBtn);
+
+				// Toggle logic
+				toggleCoordsBtn.onclick = () => {
+					if (coordsDisplay.style.display === 'none') {
+						if (camera) {
+							coordsDisplay.textContent =
+								`Position: { x: ${camera.position.x.toFixed(3)}, y: ${camera.position.y.toFixed(3)}, z: ${camera.position.z.toFixed(3)} }\n` +
+								`Target:   { x: ${controls.target.x.toFixed(3)}, y: ${controls.target.y.toFixed(3)}, z: ${controls.target.z.toFixed(3)} }`;
+						}
+						coordsDisplay.style.display = 'block';
+						copyCoordsBtn.style.display = 'block';
+					} else {
+						coordsDisplay.style.display = 'none';
+						copyCoordsBtn.style.display = 'none';
+					}
+				};
+
+				// Copy logic
+				copyCoordsBtn.onclick = () => {
+					if (camera && controls) {
+						const coords =
+							`Position: { x: ${camera.position.x.toFixed(3)}, y: ${camera.position.y.toFixed(3)}, z: ${camera.position.z.toFixed(3)} }\n` +
+							`Target:   { x: ${controls.target.x.toFixed(3)}, y: ${controls.target.y.toFixed(3)}, z: ${controls.target.z.toFixed(3)} }`;
+						navigator.clipboard.writeText(coords);
+						copyCoordsBtn.textContent = 'Copied!';
+						setTimeout(() => { copyCoordsBtn.textContent = 'Copy Coords'; }, 1200);
+					}
+				};
+
+				animGroup.appendChild(camDetails);
+				// Rotation toggle inside dropdown (hidden on mobile)
+				if (!isMobileDevice()) {
+					const rotateWrap = document.createElement('label');
+					rotateWrap.style.display = 'block';
+					rotateWrap.style.margin = '6px 0 12px 0';
+					rotateWrap.style.font = '12px sans-serif';
+					const rotateToggle = document.createElement('input');
+					rotateToggle.type = 'checkbox';
+					rotateToggle.checked = controls ? !!controls.enableRotate : false;
+					rotateWrap.appendChild(rotateToggle);
+					rotateWrap.appendChild(document.createTextNode(' Enable rotation'));
+					rotateToggle.addEventListener('change', () => {
+						const enable = !!rotateToggle.checked;
+						if (controls) {
+							controls.enableRotate = enable;
+							if (THREE.TOUCH) {
+								controls.touches.ONE = enable ? THREE.TOUCH.ROTATE : THREE.TOUCH.PAN;
+								controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
+							}
+						}
+					});
+					animGroup.appendChild(rotateWrap);
+				}
+				// Front cover explicit open/close buttons (if clips exist)
+				const frontClips = animationClips.filter(isFrontCoverClip);
+				const latchClips = animationClips.filter(isLatchClip);
+				if (frontClips.length > 0) {
+					const btnOpenFront = document.createElement('button');
+					btnOpenFront.textContent = 'Open front_cover';
+					btnOpenFront.style.display = 'block';
+					btnOpenFront.style.marginBottom = '5px';
+					btnOpenFront.onclick = () => { if (isAnyAnimationPlaying()) return; playFrontCoverDirection(1, frontClips, latchClips); };
+					animGroup.appendChild(btnOpenFront);
+					const btnCloseFront = document.createElement('button');
+					btnCloseFront.textContent = 'Close front_cover';
+					btnCloseFront.style.display = 'block';
+					btnCloseFront.style.marginBottom = '12px';
+					btnCloseFront.onclick = () => { if (isAnyAnimationPlaying()) return; playFrontCoverDirection(-1, frontClips, latchClips); };
+					animGroup.appendChild(btnCloseFront);
+				}
+				// Latch explicit open/close buttons (if clips exist)
+				if (latchClips.length > 0) {
+					const btnOpenLatch = document.createElement('button');
+					btnOpenLatch.textContent = 'Open latch';
+					btnOpenLatch.style.display = 'block';
+					btnOpenLatch.style.marginBottom = '5px';
+					btnOpenLatch.onclick = () => { if (isAnyAnimationPlaying()) return; playLatchDirection(1, latchClips); };
+					animGroup.appendChild(btnOpenLatch);
+					const btnCloseLatch = document.createElement('button');
+					btnCloseLatch.textContent = 'Close latch';
+					btnCloseLatch.style.display = 'block';
+					btnCloseLatch.style.marginBottom = '12px';
+					btnCloseLatch.onclick = () => { if (isAnyAnimationPlaying()) return; playLatchDirection(-1, latchClips); };
+					animGroup.appendChild(btnCloseLatch);
+				}
+
+				// Create page buttons for all detected pages in order
+				getOrderedPageClips().forEach((clip) => {
+					const pageName = getPrimaryPageName(clip) || (clip.name || `page`);
+					// Open button (forward)
+					const btnOpen = document.createElement('button');
+					btnOpen.textContent = `Open ${pageName}`;
+					btnOpen.style.display = 'block';
+					btnOpen.style.marginBottom = '5px';
+					btnOpen.onclick = () => { if (isAnyAnimationPlaying()) return; playClipDirection(clip, 1, true); };
+					animGroup.appendChild(btnOpen);
+					// Close button (reverse)
+					const btnClose = document.createElement('button');
+					btnClose.textContent = `Close ${pageName}`;
+					btnClose.style.display = 'block';
+					btnClose.style.marginBottom = '12px';
+					btnClose.onclick = () => { if (isAnyAnimationPlaying()) return; playClipDirection(clip, -1, true); };
+					animGroup.appendChild(btnClose);
+					// Initialize page state as closed by default
+					pageOpenByClip.set(clip, false);
+					// Initialize toggle map though not used for explicit open/close
+					nextReverseByClip.set(clip, false);
+				});
+				// Pan boundary menu removed per request; settings use defaults and/or persisted values.
+				// Append dropdown to the buttons container
+				animButtonsContainer.appendChild(animGroup);
+				// Start hidden; SPACE toggles visibility
+				animButtonsContainer.style.display = 'none';
+			}
+		}
+	};
+	if (typeof urlOrBuffer === 'string') {
+		loader.load(urlOrBuffer, onLoad);
+	} else {
+		loader.parse(urlOrBuffer, '', onLoad);
+	}
+}
+
+function isPageClip(clip) {
+	// A clip is considered a page clip if any of its track target node names contains 'page'
+	return clip.tracks.some(track => {
+		const nodeName = track.name.split('.')[0];
+		return typeof nodeName === 'string' && nodeName.toLowerCase().includes('page');
+	});
+}
+
+function isFrontCoverClip(clip) {
+	return clip.tracks.some(track => {
+		const nodeName = track.name.split('.')[0];
+		return nodeName === 'front_cover';
+	});
+}
+
+function isLatchClip(clip) {
+	return clip.tracks.some(track => {
+		const nodeName = track.name.split('.')[0];
+		return nodeName === 'latch';
+	});
+}
+
+function getPrimaryPageName(clip) {
+	for (const track of clip.tracks) {
+		const nodeName = track.name.split('.')[0];
+		if (nodeName && nodeName.toLowerCase().includes('page')) return nodeName;
+	}
+	return null;
+}
+
+function extractPageIndex(name) {
+	if (!name) return Number.MAX_SAFE_INTEGER;
+	const match = name.match(/(\d+)/);
+	return match ? parseInt(match[1], 10) : Number.MAX_SAFE_INTEGER;
+}
+
+function getOrderedPageClips() {
+	if (!animationClips) return [];
+	const pages = animationClips.filter(isPageClip).map(clip => {
+		const name = getPrimaryPageName(clip) || clip.name || '';
+		return { clip, name, index: extractPageIndex(name) };
+	});
+	pages.sort((a, b) => a.index - b.index);
+	return pages.map(p => p.clip);
+}
+
+function playClipDirection(clip, direction, enforcePageState = false) {
+	if (!mixer) return;
+	// Enforce page open/close rules if requested
+	if (enforcePageState && isPageClip(clip)) {
+		const isOpen = pageOpenByClip.get(clip) === true;
+		// Pages cannot turn if book is closed (front cover must be open)
+		if (!frontCoverOpen) {
+			console.warn('Cannot turn pages while the front cover is closed');
+			return;
+		}
+		// If opening a lower-index page while later pages are open, close later pages first
+		if (direction > 0) {
+			const ordered = getOrderedPageClips();
+			let idx = ordered.indexOf(clip);
+			if (idx > -1) {
+				const laterOpen = [];
+				for (let i = ordered.length - 1; i > idx; i--) {
+					if (pageOpenByClip.get(ordered[i]) === true) laterOpen.push(ordered[i]);
+				}
+				if (laterOpen.length > 0) {
+					// Close open later pages in descending order, then proceed to target
+					closePagesThen(() => {
+						// After closing later pages, ensure previous pages are open smoothly
+						let needPrevOpen = false;
+						for (let i = 0; i < idx; i++) {
+							if (pageOpenByClip.get(ordered[i]) !== true) { needPrevOpen = true; break; }
+						}
+						if (needPrevOpen) {
+							openPagesThen(clip, () => playClipDirection(clip, 1, true));
+						} else {
+							playClipDirection(clip, 1, true);
+						}
+					}, laterOpen);
+					return;
+				}
+			}
+			// Smoothly open all previous pages if needed
+			const ordered2 = getOrderedPageClips();
+			const idx2 = ordered2.indexOf(clip);
+			if (idx2 > 0) {
+				let needOpen = false;
+				for (let i = 0; i < idx2; i++) {
+					if (pageOpenByClip.get(ordered2[i]) !== true) {
+						needOpen = true;
+						break;
+					}
+				}
+				if (needOpen) {
+					openPagesThen(clip, () => playClipDirection(clip, direction, true));
+					return;
+				}
+			}
+		}
+		// Enforce sequential closing: cannot close page N if any later page is open
+		if (direction < 0) {
+			const ordered3 = getOrderedPageClips();
+			const idx3 = ordered3.indexOf(clip);
+			if (idx3 !== -1) {
+				for (let i = idx3 + 1; i < ordered3.length; i++) {
+					if (pageOpenByClip.get(ordered3[i]) === true) {
+						console.warn('Close later pages first');
+						return;
+					}
+				}
+			}
+		}
+		if (direction > 0 && isOpen) {
+			// Already open: do nothing
+			return;
+		}
+		if (direction < 0 && !isOpen) {
+			// Already closed: do nothing
+			return;
+		}
+	}
+	// Stop only conflicting actions
+	const targets = getClipTargetNodeNames(clip);
+	stopConflictingActions(targets, [clip]);
+	// Configure and play
+	const action = mixer.clipAction(clip);
+	action.enabled = true;
+	action.setLoop(THREE.LoopOnce, 1);
+	action.clampWhenFinished = true;
+	if (direction < 0) {
+		action.time = clip.duration;
+		action.paused = false;
+		action.timeScale = -1;
+		action.play();
+		playingDirectionByAction.set(action, -1);
+	} else {
+		action.reset();
+		action.timeScale = 1;
+		action.play();
+		playingDirectionByAction.set(action, 1);
+	}
+}
+
+function playFrontCoverDirection(direction, frontClips, latchClips) {
+	if (!mixer || !frontClips || frontClips.length === 0) return;
+	if (direction > 0) {
+		// Opening front cover requires latch to be open
+		if (!latchOpen && latchClips && latchClips.length > 0) {
+			const startedLatchActions = playLatchDirection(1, latchClips, /*returnActions*/ true) || [];
+			if (startedLatchActions.length === 0) return;
+			const remaining = new Set(startedLatchActions);
+			const handler = (e) => {
+				const a = e.action;
+				if (remaining.has(a)) {
+					remaining.delete(a);
+					if (remaining.size === 0) {
+						mixer.removeEventListener('finished', handler);
+						// Now open front cover
+						playFrontCoverDirection(1, frontClips, latchClips);
+					}
+				}
+			};
+			mixer.addEventListener('finished', handler);
+			return;
+		}
+	} else {
+		// Closing front cover: if any page is open, close all open pages in order first
+		const orderedPages = getOrderedPageClips();
+		const openPagesDesc = orderedPages
+			.filter(clip => pageOpenByClip.get(clip) === true)
+			.sort((a, b) => extractPageIndex(getPrimaryPageName(b) || b.name) - extractPageIndex(getPrimaryPageName(a) || a.name));
+		if (openPagesDesc.length > 0) {
+			closePagesThen(() => playFrontCoverDirection(-1, frontClips, latchClips), openPagesDesc);
+			return;
+		}
+	}
+	// Enforce front cover state
+	if (direction > 0 && frontCoverOpen) return;
+	if (direction < 0 && !frontCoverOpen) return;
+	// Determine combined targets of front cover clips and stop only conflicts
+	const combinedTargets = new Set();
+	frontClips.forEach(c => getClipTargetNodeNames(c).forEach(n => combinedTargets.add(n)));
+	stopConflictingActions(combinedTargets, frontClips);
+	// Play all front cover clips in the requested direction
+	const startedFrontActions = [];
+	frontClips.forEach(clip => {
+		const action = mixer.clipAction(clip);
+		action.enabled = true;
+		action.setLoop(THREE.LoopOnce, 1);
+		action.clampWhenFinished = true;
+		if (direction < 0) {
+			action.time = clip.duration;
+			action.paused = false;
+			action.timeScale = -1;
+			action.play();
+			playingDirectionByAction.set(action, -1);
+			startedFrontActions.push(action);
+		} else {
+			action.reset();
+			action.timeScale = 1;
+			action.play();
+			playingDirectionByAction.set(action, 1);
+		}
+	});
+
+	// Play spline animation together with front cover
+	if (animationClips) {
+		// Find spline animation clips by name or by track targeting 'spline'
+		const splineClips = animationClips.filter(clip => {
+			if (clip.name && clip.name.toLowerCase().includes('spline')) return true;
+			return clip.tracks.some(track => track.name.split('.')[0] === 'spline');
+		});
+		if (splineClips.length === 0) {
+			console.warn('No spline animation clips found to play with front cover.');
+		} else {
+			console.log('Playing spline animation(s) with front cover:', splineClips.map(c => c.name));
+		}
+		splineClips.forEach(clip => {
+			const action = mixer.clipAction(clip);
+			action.enabled = true;
+			action.setLoop(THREE.LoopOnce, 1);
+			action.clampWhenFinished = true;
+			if (direction < 0) {
+				action.time = clip.duration;
+				action.paused = false;
+				action.timeScale = -1;
+				action.play();
+				playingDirectionByAction.set(action, -1);
+			} else {
+				action.reset();
+				action.timeScale = 1;
+				action.play();
+				playingDirectionByAction.set(action, 1);
+			}
+		});
+	}
+
+	// If we are closing the front cover, then after it fully closes, also close the latch
+	if (direction < 0 && latchClips && latchClips.length > 0 && startedFrontActions.length > 0) {
+		const remainingFront = new Set(startedFrontActions);
+		const onFrontClosed = (e) => {
+			if (remainingFront.has(e.action)) {
+				remainingFront.delete(e.action);
+				if (remainingFront.size === 0) {
+					mixer.removeEventListener('finished', onFrontClosed);
+					// Front cover finished closing; now close the latch
+					playLatchDirection(-1, latchClips);
+				}
+			}
+		};
+		mixer.addEventListener('finished', onFrontClosed);
+	}
+}
+
+function closePagesThen(done, pagesToCloseDesc) {
+	if (!pagesToCloseDesc || pagesToCloseDesc.length === 0) {
+		done();
+		return;
+	}
+	const [first, ...rest] = pagesToCloseDesc;
+	const action = mixer.clipAction(first);
+	action.enabled = true;
+	action.setLoop(THREE.LoopOnce, 1);
+	action.clampWhenFinished = true;
+	action.time = first.duration;
+	action.paused = false;
+	action.timeScale = -1;
+	action.play();
+	playingDirectionByAction.set(action, -1);
+	const handler = (e) => {
+		if (e.action === action) {
+			mixer.removeEventListener('finished', handler);
+			closePagesThen(done, rest);
+		}
+	};
+	mixer.addEventListener('finished', handler);
+}
+
+function playLatchDirection(direction, latchClips, returnActions = false) {
+	if (!mixer || !latchClips || latchClips.length === 0) return returnActions ? [] : undefined;
+	// Enforce latch state + dependency: cannot close latch unless front cover is closed
+	if (direction > 0 && latchOpen) return returnActions ? [] : undefined;
+	if (direction < 0) {
+		if (!latchOpen) return returnActions ? [] : undefined; // already closed
+		if (frontCoverOpen) {
+			console.warn('Cannot close latch while front cover is open');
+			return returnActions ? [] : undefined;
+		}
+	}
+	// Determine combined targets of latch clips and stop only conflicts
+	const combinedTargets = new Set();
+	latchClips.forEach(c => getClipTargetNodeNames(c).forEach(n => combinedTargets.add(n)));
+	stopConflictingActions(combinedTargets, latchClips);
+	// Play all latch clips in the requested direction
+	const started = [];
+	latchClips.forEach(clip => {
+		const action = mixer.clipAction(clip);
+		action.enabled = true;
+		action.setLoop(THREE.LoopOnce, 1);
+		action.clampWhenFinished = true;
+		if (direction < 0) {
+			action.time = clip.duration;
+			action.paused = false;
+			action.timeScale = -1;
+			action.play();
+			playingDirectionByAction.set(action, -1);
+			started.push(action);
+		} else {
+			action.reset();
+			action.timeScale = 1;
+			action.play();
+			playingDirectionByAction.set(action, 1);
+			started.push(action);
+		}
+	});
+	return returnActions ? started : undefined;
+}
+
+function getClipTargetNodeNames(clip) {
+	const names = new Set();
+	clip.tracks.forEach(track => {
+		const nodeName = track.name.split('.')[0];
+		if (nodeName) names.add(nodeName);
+	});
+	return names;
+}
+
+function setsIntersect(a, b) {
+	for (const v of a) {
+		if (b.has(v)) return true;
+	}
+	return false;
+}
+
+function stopConflictingActions(targetNodeNames, excludeClips = []) {
+	if (!mixer || !animationClips) return;
+	animationClips.forEach(c => {
+		if (excludeClips.includes(c)) return;
+		const names = getClipTargetNodeNames(c);
+		if (setsIntersect(targetNodeNames, names)) {
+			const a = mixer.existingAction(c);
+			if (a) a.stop();
+		}
+	});
+}
+
+function animate() {
+	requestAnimationFrame(animate);
+	if (mixer) mixer.update(0.016); // ~60fps
+	controls.update();
+	// Enforce pan boundary (if enabled)
+	if (panLimitEnabled && panLimitRadius > 0 && panOriginTarget) {
+		const curT = controls.target;
+		const delta = curT.clone().sub(panOriginTarget);
+		const dist = delta.length();
+		if (dist > panLimitRadius) {
+			delta.setLength(panLimitRadius);
+			const clampedTarget = panOriginTarget.clone().add(delta);
+			const adjust = clampedTarget.clone().sub(curT);
+			controls.target.copy(clampedTarget);
+			camera.position.add(adjust);
+		}
+	}
+	// Update camera HUD at ~10 fps to reduce cost
+	if (cameraInfoEl) {
+		const now = performance.now();
+		if (now - lastCamHudUpdate > 100) {
+			lastCamHudUpdate = now;
+			const p = camera.position;
+			const t = controls ? controls.target : new THREE.Vector3();
+			const rot = camera.rotation;
+			const fmt = (n)=> (Math.abs(n) < 1e-4 ? 0 : n).toFixed(3);
+			const desktop = !isMobileDevice();
+			cameraInfoEl.innerHTML = `
+				<div class="row"><span class="label">pos</span><span>[${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)}]</span></div>
+				<div class="row"><span class="label">target</span><span>[${fmt(t.x)}, ${fmt(t.y)}, ${fmt(t.z)}]</span></div>
+				<div class="row"><span class="label">rot</span><span>[${fmt(rot.x)}, ${fmt(rot.y)}, ${fmt(rot.z)}]</span></div>
+				<div class="row"><span class="label">fov</span><span>${fmt(camera.fov)}</span></div>
+				<div class="row" style="margin-top:6px"><button id="copyCamBtn" style="cursor:pointer;padding:4px 8px;border-radius:4px;border:1px solid #999;background:#1e1e1e;color:#fff;">Copy coords</button></div>
+				${isMobileDevice() ? `<div class=\"row\"><span class=\"copy-hint\">tap to copy</span></div>` : ''}
+			`;
+		}
+	}
+	renderer.render(scene, camera);
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+	initViewer();
+	const openFileBtn = document.getElementById('openFileBtn');
+	const fileInput = document.getElementById('fileInput');
+	const playAnimBtn = document.getElementById('playAnimBtn');
+	const openBookBtn = document.getElementById('openBookBtn');
+	// Hide and disable removed controls
+	if (openFileBtn) openFileBtn.style.display = 'none';
+	if (fileInput) fileInput.style.display = 'none';
+	if (playAnimBtn) playAnimBtn.style.display = 'none';
+	if (openBookBtn) openBookBtn.style.display = 'none';
+	if (cameraInfoEl) {
+		// Mobile: tap anywhere on the HUD to copy its text
+		if (isMobileDevice()) {
+			cameraInfoEl.addEventListener('click', () => {
+				try {
+					const txt = cameraInfoEl.textContent || '';
+					if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt);
+				} catch (e) {}
+			}, { passive: true });
+		}
+		// All devices: delegated click for the explicit button
+		cameraInfoEl.addEventListener('click', (ev) => {
+			const el = ev.target;
+			if (el && el.id === 'copyCamBtn') {
+				try {
+					const snippet = formatCameraSnippet();
+					if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(snippet);
+				} catch (e) {}
+			}
+		});
+	}
+	// Ensure no handlers remain
+	if (openFileBtn) openFileBtn.onclick = null;
+	if (fileInput) fileInput.onchange = null;
+	if (playAnimBtn) playAnimBtn.onclick = null;
+	if (openBookBtn) openBookBtn.onclick = null;
+});
+
+
+
