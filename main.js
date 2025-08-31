@@ -689,6 +689,8 @@ function resumeFront(direction, actions, afterAll) {
 }
 
 function loadGLB(urlOrBuffer) {
+	// Show loader overlay
+	try { const el = document.getElementById('loaderOverlay'); if (el) el.style.display = 'flex'; } catch {}
 	if (currentModel) {
 		scene.remove(currentModel);
 		currentModel.traverse(child => {
@@ -925,11 +927,18 @@ function loadGLB(urlOrBuffer) {
 				animButtonsContainer.style.display = 'none';
 			}
 		}
+		// Hide loader when everything is set up
+		try { const el = document.getElementById('loaderOverlay'); if (el) el.style.display = 'none'; } catch {}
+	};
+	const onError = (err) => {
+		console.error('Failed to load GLB', err);
+		// Hide loader to unblock UI even if error occurs
+		try { const el = document.getElementById('loaderOverlay'); if (el) el.style.display = 'none'; } catch {}
 	};
 	if (typeof urlOrBuffer === 'string') {
-		loader.load(urlOrBuffer, onLoad);
+		loader.load(urlOrBuffer, onLoad, undefined, onError);
 	} else {
-		loader.parse(urlOrBuffer, '', onLoad);
+		try { loader.parse(urlOrBuffer, '', onLoad, onError); } catch (e) { onError(e); }
 	}
 }
 
