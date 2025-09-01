@@ -337,13 +337,6 @@ function initViewer() {
 		panOriginTarget = controls.target.clone();
 	}
 
-	// Show intro overlay at startup
-	const welcomeOverlay = document.getElementById('welcomeOverlay');
-	if (welcomeOverlay) {
-		welcomeOverlay.classList.remove('hide');
-		welcomeOverlay.style.opacity = '1';
-		welcomeOverlay.style.pointerEvents = 'auto';
-	}
 	// Hide control menu by default; toggle with SPACE BAR
 	window.addEventListener('keydown', (ev) => {
 		if (ev.code === 'Space' && animButtonsContainer) {
@@ -708,13 +701,6 @@ function resumeFront(direction, actions, afterAll) {
 }
 
 function loadGLB(urlOrBuffer) {
-	// Show intro overlay (if not already visible)
-	const welcomeOverlay = document.getElementById('welcomeOverlay');
-	if (welcomeOverlay) {
-		welcomeOverlay.classList.remove('hide');
-		welcomeOverlay.style.opacity = '1';
-		welcomeOverlay.style.pointerEvents = 'auto';
-	}
 	if (currentModel) {
 		scene.remove(currentModel);
 		currentModel.traverse(child => {
@@ -735,17 +721,6 @@ function loadGLB(urlOrBuffer) {
 	const onLoad = (gltf) => {
 		// Fade out intro overlay when model is loaded
 		const welcomeOverlay = document.getElementById('welcomeOverlay');
-		if (welcomeOverlay) {
-			// Ensure overlay is visible for at least 1.5s before fading
-			setTimeout(() => {
-				welcomeOverlay.classList.add('hide');
-				welcomeOverlay.style.pointerEvents = 'none';
-				// Wait for CSS transition to finish before hiding
-				setTimeout(() => {
-					welcomeOverlay.style.display = 'none';
-				}, 1500); // matches CSS transition
-			}, 500); // minimum visible time before fade
-		}
 		currentModel = gltf.scene;
 		scene.add(currentModel);
 		// On mobile, set exact default view (requested values)
@@ -964,13 +939,29 @@ function loadGLB(urlOrBuffer) {
 				animButtonsContainer.style.display = 'none';
 			}
 		}
-		// Hide loader when everything is set up
-		try { const el = document.getElementById('loaderOverlay'); if (el) el.style.display = 'none'; } catch {}
+		// Hide loader overlay with fade when everything is set up
+		try {
+			const el = document.getElementById('loaderOverlay');
+			if (el) {
+				el.classList.add('hide');
+				setTimeout(() => {
+					el.style.display = 'none';
+				}, 1500); // matches CSS transition
+			}
+		} catch {}
 	};
 	const onError = (err) => {
 		console.error('Failed to load GLB', err);
 		// Hide loader to unblock UI even if error occurs
-		try { const el = document.getElementById('loaderOverlay'); if (el) el.style.display = 'none'; } catch {}
+		try {
+			const el = document.getElementById('loaderOverlay');
+			if (el) {
+				el.classList.add('hide');
+				setTimeout(() => {
+					el.style.display = 'none';
+				}, 1500);
+			}
+		} catch {}
 	};
 	if (typeof urlOrBuffer === 'string') {
 		loader.load(urlOrBuffer, onLoad, undefined, onError);
