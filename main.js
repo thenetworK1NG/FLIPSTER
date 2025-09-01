@@ -719,8 +719,7 @@ function loadGLB(urlOrBuffer) {
 	latchOpen = false;
 	const loader = new GLTFLoader();
 	const onLoad = (gltf) => {
-		// Fade out intro overlay when model is loaded
-		const welcomeOverlay = document.getElementById('welcomeOverlay');
+		// Loader overlay logic removed
 		currentModel = gltf.scene;
 		scene.add(currentModel);
 		// On mobile, set exact default view (requested values)
@@ -939,29 +938,11 @@ function loadGLB(urlOrBuffer) {
 				animButtonsContainer.style.display = 'none';
 			}
 		}
-		// Hide loader overlay with fade when everything is set up
-		try {
-			const el = document.getElementById('loaderOverlay');
-			if (el) {
-				el.classList.add('hide');
-				setTimeout(() => {
-					el.style.display = 'none';
-				}, 1500); // matches CSS transition
-			}
-		} catch {}
+	// Loader overlay logic removed
 	};
 	const onError = (err) => {
 		console.error('Failed to load GLB', err);
-		// Hide loader to unblock UI even if error occurs
-		try {
-			const el = document.getElementById('loaderOverlay');
-			if (el) {
-				el.classList.add('hide');
-				setTimeout(() => {
-					el.style.display = 'none';
-				}, 1500);
-			}
-		} catch {}
+		// Loader overlay logic removed
 	};
 	if (typeof urlOrBuffer === 'string') {
 		loader.load(urlOrBuffer, onLoad, undefined, onError);
