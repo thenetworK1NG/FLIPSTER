@@ -240,19 +240,23 @@ function initViewer() {
 	// Mobile/desktop drag-to-turn and click/tap toggle
 	if (isMobileDevice()) {
 		const canvas = renderer.domElement;
+		// Track active touch pointers for proper pinch detection
+		let activeTouchPointers = new Set();
 		canvas.addEventListener('pointerdown', (ev) => {
 			if (ev.pointerType !== 'touch') return;
-			// Ignore multi-touch (pinch) events, let OrbitControls handle zoom
-			if (ev.touches && ev.touches.length > 1) return;
-			_touchDownPos = { x: ev.clientX, y: ev.clientY };
-			_touchDownTime = performance.now();
-			_didDrag = false;
-			_potentialDragTarget = detectTurnableAt(ev.clientX, ev.clientY);
+			activeTouchPointers.add(ev.pointerId);
+			// Only run page turn logic for single-finger touch
+			if (activeTouchPointers.size === 1) {
+				_touchDownPos = { x: ev.clientX, y: ev.clientY };
+				_touchDownTime = performance.now();
+				_didDrag = false;
+				_potentialDragTarget = detectTurnableAt(ev.clientX, ev.clientY);
+			}
 		}, { passive: true });
 		canvas.addEventListener('pointermove', (ev) => {
 			if (ev.pointerType !== 'touch') return;
-			// Ignore multi-touch (pinch) events
-			if (ev.touches && ev.touches.length > 1) return;
+			// Only run drag logic for single-finger touch
+			if (activeTouchPointers.size !== 1) return;
 			if (!_touchDownPos) return;
 			const moved = Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y);
 			if (dragState) {
@@ -268,18 +272,20 @@ function initViewer() {
 		}, { passive: true });
 		canvas.addEventListener('pointerup', (ev) => {
 			if (ev.pointerType !== 'touch') return;
-			// Ignore multi-touch (pinch) events
-			if (ev.touches && ev.touches.length > 1) return;
-			const tNow = performance.now();
-			const moved = _touchDownPos ? Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y) : 1e9;
-			const dt = tNow - _touchDownTime;
-			if (dragState) {
-				endDrag();
-			} else if (_touchDownPos && !_didDrag && moved < 8 && dt < 350) {
-				handleMobileTap(ev);
+			activeTouchPointers.delete(ev.pointerId);
+			// Only run page tap logic for single-finger touch
+			if (activeTouchPointers.size === 0) {
+				const tNow = performance.now();
+				const moved = _touchDownPos ? Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y) : 1e9;
+				const dt = tNow - _touchDownTime;
+				if (dragState) {
+					endDrag();
+				} else if (_touchDownPos && !_didDrag && moved < 8 && dt < 350) {
+					handleMobileTap(ev);
+				}
+				_touchDownPos = null;
+				_potentialDragTarget = null;
 			}
-			_touchDownPos = null;
-			_potentialDragTarget = null;
 		}, { passive: true });
 	} else {
 		const canvas = renderer.domElement;
