@@ -1,0 +1,16 @@
+*, *:before, *:after {
+    box-sizing: border-box;
+    position: relative;
+}
+* {
+    transform-style: preserve-3d;
+}
+:root {
+    --bg-primary:     #0e0e14;
+    --text-primary:   rgba(255, 255, 255, 0.92);
+    --accent:         #6366f1;
+}
+body { margin: 0; overflow: hidden; }
+#viewer { width: 100vw; height: 100vh; display: block; }
+#openFileBtn { position: absolute; top: 10px; left: 10px; z-index: 10; }
+#fileInput { display: none; }

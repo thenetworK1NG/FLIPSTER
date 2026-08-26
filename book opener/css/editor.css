@@ -1,0 +1,212 @@
+.editor-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 5000;
+    background: rgba(0, 0, 0, 0.85);
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+}
+.editor-overlay.open {
+    display: flex;
+}
+.editor-toolbar {
+    display: flex;
+    gap: 6px;
+    padding: 8px 16px;
+    background: rgba(20, 20, 30, 0.95);
+    border-radius: 10px 10px 0 0;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-bottom: none;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+.editor-toolbar button {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.8);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+}
+.editor-toolbar button:hover {
+    background: rgba(255, 255, 255, 0.2);
+    color: white;
+}
+.editor-toolbar button.danger:hover {
+    background: rgba(255, 60, 60, 0.3);
+    color: #ff8888;
+}
+.editor-toolbar button.primary {
+    background: rgba(74, 158, 255, 0.3);
+    border-color: rgba(74, 158, 255, 0.5);
+    color: #8ac4ff;
+}
+.editor-toolbar button.primary:hover {
+    background: rgba(74, 158, 255, 0.5);
+    color: white;
+}
+.editor-toolbar .separator {
+    width: 1px;
+    background: rgba(255, 255, 255, 0.15);
+    margin: 0 4px;
+    align-self: stretch;
+}
+.editor-canvas-wrap {
+    position: relative;
+    background: #1a1a2e;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0 0 10px 10px;
+    overflow: hidden;
+}
+.editor-canvas {
+    position: relative;
+    width: 390px;
+    height: 596px;
+    overflow: hidden;
+    cursor: crosshair;
+}
+.editor-bg {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+.editor-hint {
+    position: absolute;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.35);
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+/* Collage image elements */
+.collage-el {
+    position: absolute;
+    cursor: move;
+    user-select: none;
+    touch-action: none;
+}
+.collage-el img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: fill;
+    pointer-events: none;
+}
+.collage-el.selected {
+    outline: 2px solid #4a9eff;
+    outline-offset: 1px;
+}
+
+/* Resize handles */
+.resize-handle {
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    background: white;
+    border: 1px solid #4a9eff;
+    border-radius: 2px;
+    z-index: 10;
+    pointer-events: auto;
+}
+.resize-handle.tl { top: -5px; left: -5px; cursor: nwse-resize; }
+.resize-handle.tr { top: -5px; right: -5px; cursor: nesw-resize; }
+.resize-handle.bl { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.resize-handle.br { bottom: -5px; right: -5px; cursor: nwse-resize; }
+.resize-handle.tm { top: -5px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.resize-handle.bm { bottom: -5px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.resize-handle.ml { top: 50%; left: -5px; transform: translateY(-50%); cursor: ew-resize; }
+.resize-handle.mr { top: 50%; right: -5px; transform: translateY(-50%); cursor: ew-resize; }
+
+/* Rotate handle */
+.rotate-handle {
+    position: absolute;
+    top: -28px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 14px;
+    height: 14px;
+    background: #4a9eff;
+    border: 2px solid white;
+    border-radius: 50%;
+    cursor: grab;
+    z-index: 10;
+}
+.rotate-handle::before {
+    content: '';
+    position: absolute;
+    bottom: -14px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 1px;
+    height: 14px;
+    background: rgba(74, 158, 255, 0.5);
+}
+.rotate-label {
+    position: absolute;
+    top: -26px;
+    right: -20px;
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.6);
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+/* Background picker */
+.editor-bg-picker {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+.editor-bg-picker label {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+    margin-right: 4px;
+}
+.editor-bg-picker input[type="color"] {
+    width: 24px;
+    height: 24px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    padding: 0;
+    cursor: pointer;
+    background: none;
+}
+
+/* Drop zone overlay */
+.editor-drop-zone {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(74, 158, 255, 0.15);
+    border: 2px dashed rgba(74, 158, 255, 0.5);
+    border-radius: 4px;
+    z-index: 20;
+    pointer-events: none;
+}
+.editor-drop-zone.active {
+    display: flex;
+}
+.editor-drop-zone span {
+    font-size: 16px;
+    color: rgba(74, 158, 255, 0.8);
+    font-weight: 500;
+}
+
+@media (max-width: 768px) {
+    .editor-canvas {
+        width: 70vw;
+        height: 107.5vw;
+    }
+}
